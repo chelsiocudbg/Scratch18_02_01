@@ -214,10 +214,153 @@ function cmdlog
 	sync
 }
 
+function get_mem_region_start
+{
+	local memtype memtype_region memtype_base
+	local entity region base
+
+	entity="$1"
+	memtype="$2"
+	region="$(grep -i "$entity" $debugfs_path/$driver/$busp/meminfo)"
+	base=${region%-*}  # Get everything before -
+	base=${base#*:}    # Get everything after :
+
+	###
+	# Get base relative to @memtype (i.e. EDC*/MC* start)
+	###
+	memtype_region="$(grep -i "$memtype" $debugfs_path/$driver/$busp/meminfo)"
+	memtype_base=${memtype_region%-*}
+	memtype_base=${memtype_base#*:}
+
+	echo $(($base - $memtype_base))
+}
+
+function get_mem_region_end
+{
+	local memtype memtype_region memtype_base
+	local entity region base
+
+	entity="$1"
+	memtype="$2"
+	region="$(grep -i "$entity" $debugfs_path/$driver/$busp/meminfo)"
+	end=${region#*-}   # Get everything after -
+	end=${end%[*}      # Get everything before [
+
+	###
+	# Get end relative to @memtype (i.e. EDC*/MC* start)
+	###
+	memtype_region="$(grep -i "$memtype" $debugfs_path/$driver/$busp/meminfo)"
+	memtype_base=${memtype_region%-*}
+	memtype_base=${memtype_base#*:}
+
+	echo $(($end - $memtype_base))
+}
+
+function round_up
+{
+	local x y
+
+	x="$1"
+	y="$2"
+	echo $((($x + $y - 1) / $y * $y))
+}
+
+function round_down
+{
+	local x y
+
+	x="$1"
+	y="$2"
+	echo $((($x / $y) * $y))
+}
+
+function get_debugfs_mc_entity
+{
+	local tx_payload_base tx_payload_end
+	local rx_payload_base rx_payload_end
+	local src_debugfs_path src_zero_path
+	local entity base end size rem_size
+	local chunk_size blk_size count
+	local ddcmd src_path dst_path
+	local j cur_off cur_end
+	local ncpu max_cpu
+
+	entity="$1"
+
+	# Get mc start and end
+	base=$(get_mem_region_start "$entity" "$entity")
+	end=$(get_mem_region_end "$entity" "$entity")
+	size=$(($end - $base + 1))
+
+	# Fill dd command parameters
+	chunk_size=$((256 * 1024 * 1024)) # 256 MB
+	blk_size=$((32 * 1024 * 1024)) # 32 MB
+	count=$(($chunk_size / $blk_size))
+	src_debugfs_path="${debugfs_path}/$driver/${busp}/${entity}"
+	src_zero_path="/dev/zero"
+	dst_path="${extract_debugfs_dir}/$driver"
+
+	# Get number of cpus.  Max 8 needed per adapter.
+	max_cpu=8
+	ncpu="$(grep -c ^processor /proc/cpuinfo)"
+	ncpu=$(($ncpu<$max_cpu?$ncpu:$max_cpu))
+
+	# Get TX and RX Payload base and end
+	tx_payload_base=$(get_mem_region_start "Tx payload" "$entity")
+	tx_payload_end=$(get_mem_region_end "Tx payload" "$entity")
+	rx_payload_base=$(get_mem_region_start "Rx payload" "$entity")
+	rx_payload_end=$(get_mem_region_end "Rx payload" "$entity")
+
+	###
+	# Round up payload base to @chunk_size and round down
+	# payload end to @chunk_size.  Only full chunks will
+	# be skipped.
+	###
+	tx_payload_base=$(round_up $tx_payload_base $chunk_size)
+	tx_payload_end=$(round_down $tx_payload_end $chunk_size)
+	rx_payload_base=$(round_up $rx_payload_base $chunk_size)
+	rx_payload_end=$(round_down $rx_payload_end $chunk_size)
+
+	# Distribute work across cpus
+	rem_size=$size
+	j=0
+	while [ $rem_size -gt 0 ]; do
+		for i in `seq 0 $(($ncpu - 1))`; do
+			cur_off=$(($blk_size * $count * $j))
+			src_path="$src_debugfs_path"
+			if [[ -z $cudbgpayload ]]; then
+				if [[ $cur_off -ge $tx_payload_base && $(($cur_off + $chunk_size)) -le $tx_payload_end  ]]; then
+					# Fill Payload full chunk with zero
+					src_path="$src_zero_path"
+				fi
+				if [[ $cur_off -ge $rx_payload_base && $(($cur_off + $chunk_size)) -le $rx_payload_end ]]; then
+					# Fill Payload full chunk with zero
+					src_path="$src_zero_path"
+				fi
+			fi
+			ddcmd="dd if=$src_path of=$dst_path/${entity}_task_$j bs=$blk_size count=$count skip=$(($count * $j))"
+			printhead2 "taskset $((1<<$i)) $ddcmd"
+			taskset $((1<<$i)) $ddcmd > /dev/null 2>&1 &
+			j=$(($j + 1))
+			rem_size=$(($rem_size - $chunk_size))
+			if [[ $rem_size -le 0 ]]; then
+				break
+			fi
+		done
+		wait
+	done
+	chmod 444 ${dst_path}/${entity}_task_*
+}
+
 function get_debugfs_entity
 {
+	local dd_bin mcregex
+
 	entity=$1
 	driver=$2
+
+	dd_bin=$(which dd)
+	mcregex="^mc"
 
 	if ! [[ -d $extract_debugfs_dir/$driver ]];then
 		mkdir -p $extract_debugfs_dir/$driver
@@ -226,10 +369,14 @@ function get_debugfs_entity
 	if [[ -f $debugfs_path/$driver/$busp/$entity ]];then
 		echo -e "\nCollecting $entity"
 		entity_file=$extract_debugfs_dir/$driver/$entity
-		cmd="cp  $debugfs_path/$driver/$busp/$entity $entity_file"
-		echo $cmd
-		cmdlog "$cmd" 1
-		chmod 444 $entity_file
+		if [[ ! -z $dd_bin && $entity =~ $mcregex ]]; then
+			get_debugfs_mc_entity "$entity"
+		else
+			cmd="cp  $debugfs_path/$driver/$busp/$entity $entity_file"
+			echo $cmd
+			cmdlog "$cmd" 1
+			chmod 444 $entity_file
+		fi
 		return 0
 	else
 		return 1
