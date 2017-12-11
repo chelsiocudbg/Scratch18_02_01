@@ -1,37 +1,58 @@
-From 32aac7dae7f778898086b5f327eb4014bfc80b35 Mon Sep 17 00:00:00 2001
+From 1994ced69d95f266bda22b6019343d095f1dee97 Mon Sep 17 00:00:00 2001
 From: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
 Date: Mon, 6 Nov 2017 15:17:34 +0530
-Subject: [PATCH 3/3] cxgb4: collect cudbg debug logs during kernel crash
+Subject: [PATCH 3/4] cxgb4: collect cudbg debug logs during kernel crash
 
 Register panic notifier to collect cudbg logs during kernel panic.
 Also add support to collect cudbg logs in kdump kernel.
 
 Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
 ---
- drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c  |   5 +-
+ drivers/infiniband/hw/cxgb4/qp.c.rej            |  30 +++++
  drivers/net/ethernet/chelsio/cxgb4/cxgb4.h      |   4 +
  drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c |  60 +++++++++
  drivers/net/ethernet/chelsio/cxgb4/t4_hw.c      | 155 +++++++++++++++++++++++-
- 4 files changed, 217 insertions(+), 7 deletions(-)
+ 4 files changed, 243 insertions(+), 6 deletions(-)
+ create mode 100644 drivers/infiniband/hw/cxgb4/qp.c.rej
 
-diff --git a/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c b/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c
-index a0609efa..00fc7bf4 100644
---- a/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c
-+++ b/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c
-@@ -1345,7 +1345,10 @@ int cudbg_collect_sw_state(struct cudbg_init *pdbg_init,
- 
- 	swstate = (struct cudbg_sw_state *)temp_buff.data;
- 	swstate->fw_state = t4_read_reg(padap, PCIE_FW_A);
--	strcpy(swstate->caller_string, "ETHTOOL");
-+	if (padap->flags & K_CRASH)
-+		strcpy(swstate->caller_string, "KERNEL CRASH");
-+	else
-+		strcpy(swstate->caller_string, "ETHTOOL");
- 	swstate->os_type = CUDBG_OS_TYPE_LINUX;
- 	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
- }
+diff --git a/drivers/infiniband/hw/cxgb4/qp.c.rej b/drivers/infiniband/hw/cxgb4/qp.c.rej
+new file mode 100644
+index 00000000..61568996
+--- /dev/null
++++ b/drivers/infiniband/hw/cxgb4/qp.c.rej
+@@ -0,0 +1,30 @@
++--- drivers/infiniband/hw/cxgb4/qp.c
+++++ drivers/infiniband/hw/cxgb4/qp.c
++@@ -754,11 +754,13 @@
++ 	spin_lock_irqsave(&qhp->lock, flag);
++ 	if (t4_wq_in_error(&qhp->wq)) {
++ 		spin_unlock_irqrestore(&qhp->lock, flag);
+++		*bad_wr = wr;
++ 		return -EINVAL;
++ 	}
++ 	num_wrs = t4_sq_avail(&qhp->wq);
++ 	if (num_wrs == 0) {
++ 		spin_unlock_irqrestore(&qhp->lock, flag);
+++		*bad_wr = wr;
++ 		return -ENOMEM;
++ 	}
++ 	while (wr) {
++@@ -877,11 +879,13 @@
++ 	spin_lock_irqsave(&qhp->lock, flag);
++ 	if (t4_wq_in_error(&qhp->wq)) {
++ 		spin_unlock_irqrestore(&qhp->lock, flag);
+++		*bad_wr = wr;
++ 		return -EINVAL;
++ 	}
++ 	num_wrs = t4_rq_avail(&qhp->wq);
++ 	if (num_wrs == 0) {
++ 		spin_unlock_irqrestore(&qhp->lock, flag);
+++		*bad_wr = wr;
++ 		return -ENOMEM;
++ 	}
++ 	while (wr) {
 diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
-index a1ec65f5..c73cf944 100644
+index bd70e7c5..3bc48adb 100644
 --- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
 +++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
 @@ -513,6 +513,7 @@ enum {                                 /* adapter flags */
@@ -53,7 +74,7 @@ index a1ec65f5..c73cf944 100644
  
  /* Defined bit width of user definable filter tuples
 diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
-index d7a53102..39a3bd2c 100644
+index b30e04dd..79623a10 100644
 --- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
 +++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
 @@ -3718,6 +3718,22 @@ static struct fw_info *find_fw_info(int chip)
@@ -145,7 +166,7 @@ index d7a53102..39a3bd2c 100644
  	} else
  		pci_release_regions(pdev);
 diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
-index b1519aef..c591247f 100644
+index c295848a..c6200b39 100644
 --- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
 +++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
 @@ -255,6 +255,143 @@ static void t4_record_mbox(struct adapter *adapter,
@@ -322,7 +343,7 @@ index b1519aef..c591247f 100644
  	}
  }
  
-@@ -7710,8 +7855,6 @@ static void init_link_config(struct link_config *lc, unsigned int pcaps,
+@@ -7713,8 +7858,6 @@ static void init_link_config(struct link_config *lc, unsigned int pcaps,
  	}
  }
  
