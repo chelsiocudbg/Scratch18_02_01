@@ -1,4 +1,4 @@
-From 35bbf3b205fae1c0df589420a48bf97fff824153 Mon Sep 17 00:00:00 2001
+From 87ca82c9d8f926d65e121e3d63c35ead94503caa Mon Sep 17 00:00:00 2001
 From: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
 Date: Tue, 7 Nov 2017 19:34:38 +0530
 Subject: [PATCH 2/4] cxgb4: add cudbg support
@@ -8,7 +8,7 @@ Add support to collect cudbg debug logs from cxgb4.
 Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
 ---
  drivers/net/ethernet/chelsio/cxgb4/Makefile        |   3 +-
- drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c  |  26 +-
+ drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c  |  27 +-
  .../net/ethernet/chelsio/cxgb4/cudbg_flash_utils.c | 241 +++++++++++++++
  drivers/net/ethernet/chelsio/cxgb4/cudbg_if.h      |  42 +++
  drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c     | 302 ++++++++++++-------
@@ -20,7 +20,7 @@ Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
  drivers/net/ethernet/chelsio/cxgb4/fastlz.h        |  88 ++++++
  drivers/net/ethernet/chelsio/cxgb4/fastlz_api.c    | 176 +++++++++++
  drivers/net/ethernet/chelsio/cxgb4/fastlz_common.h | 134 +++++++++
- 13 files changed, 1394 insertions(+), 116 deletions(-)
+ 13 files changed, 1395 insertions(+), 116 deletions(-)
  create mode 100644 drivers/net/ethernet/chelsio/cxgb4/cudbg_flash_utils.c
  create mode 100644 drivers/net/ethernet/chelsio/cxgb4/fastlz.c
  create mode 100644 drivers/net/ethernet/chelsio/cxgb4/fastlz.h
@@ -42,7 +42,7 @@ index 5414a7de..f4423026 100644
  cxgb4-$(CONFIG_CHELSIO_T4_UWIRE) +=  cxgb4_ppm.o
  cxgb4-$(CONFIG_DEBUG_FS) += cxgb4_debugfs.o
 diff --git a/drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c b/drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c
-index f78ba174..0543c35e 100644
+index f78ba174..9058b81a 100644
 --- a/drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c
 +++ b/drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c
 @@ -18,8 +18,10 @@
@@ -57,7 +57,7 @@ index f78ba174..0543c35e 100644
  		   struct cudbg_buffer *pin_buff)
  {
  	u32 offset;
-@@ -28,17 +30,35 @@ int cudbg_get_buff(struct cudbg_buffer *pdbg_buff, u32 size,
+@@ -28,17 +30,36 @@ int cudbg_get_buff(struct cudbg_buffer *pdbg_buff, u32 size,
  	if (offset + size > pdbg_buff->size)
  		return CUDBG_STATUS_NO_MEM;
  
@@ -83,8 +83,9 @@ index f78ba174..0543c35e 100644
 +	 * compression result during pdbg_init->compress_buff
 +	 * allocation.  So, we can never run out of space.
 +	 */
-+	pin_buff->data = (char *)pdbg_init->compress_buff + pdbg_buff->size;
-+	pin_buff->offset = pdbg_buff->size;
++	pin_buff->data = (char *)pdbg_init->compress_buff +
++			 pdbg_init->outbuf_size;
++	pin_buff->offset = pdbg_init->outbuf_size;
 +	pin_buff->size = CUDBG_BLOCK_SIZE;
 +}
 +

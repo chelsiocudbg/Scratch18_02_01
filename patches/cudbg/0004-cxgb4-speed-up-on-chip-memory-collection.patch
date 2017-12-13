@@ -1,4 +1,4 @@
-From d9d33db738a068646ce32ed9e58b65731d45d078 Mon Sep 17 00:00:00 2001
+From eb8b75b9b7400f43398030033cb1af5d95b0a99d Mon Sep 17 00:00:00 2001
 From: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
 Date: Thu, 23 Nov 2017 18:03:56 +0530
 Subject: [PATCH 4/4] cxgb4: speed up on-chip memory collection
@@ -10,12 +10,15 @@ to allow reading in parallel.
 Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
 ---
  drivers/net/ethernet/chelsio/cxgb4/Makefile        |  1 +
- drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c     |  8 +--
+ drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c  | 26 +++++++++
+ drivers/net/ethernet/chelsio/cxgb4/cudbg_entity.h  |  2 +
+ drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c     | 11 ++--
+ .../net/ethernet/chelsio/cxgb4/cudbg_lib_common.h  |  3 +
  drivers/net/ethernet/chelsio/cxgb4/cxgb4.h         |  4 +-
  drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c | 38 +++++++++++--
  drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c    | 26 ++++++---
  drivers/net/ethernet/chelsio/cxgb4/t4_hw.c         | 66 ++++++++++++++++++++--
- 6 files changed, 119 insertions(+), 24 deletions(-)
+ 9 files changed, 152 insertions(+), 25 deletions(-)
 
 diff --git a/drivers/net/ethernet/chelsio/cxgb4/Makefile b/drivers/net/ethernet/chelsio/cxgb4/Makefile
 index f4423026..10481761 100644
@@ -29,11 +32,61 @@ index f4423026..10481761 100644
  
  cxgb4-objs := cxgb4_main.o l2t.o t4_hw.o sge.o clip_tbl.o cxgb4_ethtool.o \
  	      cxgb4_cudbg.o \
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c b/drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c
+index 9058b81a..9e973660 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c
+@@ -43,6 +43,32 @@ int cudbg_get_buff(struct cudbg_init *pdbg_init,
+ 	return 0;
+ }
+ 
++int cudbg_get_buff_aligned(struct cudbg_init *pdbg_init,
++			   struct cudbg_buffer *pdbg_buff, u32 size,
++			   struct cudbg_buffer *pin_buff, u32 align)
++{
++	u64 off, mask = align - 1;
++	u32 offset;
++
++	offset = pdbg_buff->offset;
++	off = (uintptr_t)((u8 *)pdbg_buff->data + offset) & mask;
++	offset += off;
++	if (offset + size > pdbg_buff->size)
++		return CUDBG_STATUS_NO_MEM;
++
++	if (pdbg_init->compress_type != CUDBG_COMPRESSION_NONE) {
++		pin_buff->data = (char *)pdbg_init->compress_buff;
++		pin_buff->offset = 0;
++		pin_buff->size = size;
++		return 0;
++	}
++
++	pin_buff->data = (char *)pdbg_buff->data + offset;
++	pin_buff->offset = offset;
++	pin_buff->size = size;
++	return 0;
++}
++
+ void cudbg_get_compress_buff(struct cudbg_init *pdbg_init,
+ 			     struct cudbg_buffer *pdbg_buff,
+ 			     struct cudbg_buffer *pin_buff)
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cudbg_entity.h b/drivers/net/ethernet/chelsio/cxgb4/cudbg_entity.h
+index 2e71e334..2d70e637 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cudbg_entity.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cudbg_entity.h
+@@ -25,6 +25,8 @@
+ #define MC1_FLAG 4
+ #define HMA_FLAG 5
+ 
++#define CUDBG_MEM_ALIGN 32
++
+ #define CUDBG_ENTITY_SIGNATURE 0xCCEDB001
+ 
+ struct cudbg_mbox_log {
 diff --git a/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c b/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c
-index 2b5f339e..dccc7fa4 100644
+index 04be6aaf..480cecc4 100644
 --- a/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c
 +++ b/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c
-@@ -485,13 +485,13 @@ int cudbg_collect_fw_devlog(struct cudbg_init *pdbg_init,
+@@ -486,13 +486,13 @@ int cudbg_collect_fw_devlog(struct cudbg_init *pdbg_init,
  
  	/* Collect FW devlog */
  	if (dparams->start != 0) {
@@ -49,7 +102,17 @@ index 2b5f339e..dccc7fa4 100644
  		if (rc) {
  			cudbg_err->sys_err = CUDBG_SYSTEM_ERROR;
  			cudbg_put_buff(&temp_buff, dbg_buff);
-@@ -976,12 +976,12 @@ static int cudbg_read_fw_mem(struct cudbg_init *pdbg_init,
+@@ -966,7 +966,8 @@ static int cudbg_read_fw_mem(struct cudbg_init *pdbg_init,
+ 
+ 		bytes = min_t(unsigned long, bytes_left,
+ 			      (unsigned long)CUDBG_CHUNK_SIZE);
+-		rc = cudbg_get_buff(pdbg_init, dbg_buff, bytes, &temp_buff);
++		rc = cudbg_get_buff_aligned(pdbg_init, dbg_buff, bytes,
++					    &temp_buff, CUDBG_MEM_ALIGN);
+ 		if (rc)
+ 			return rc;
+ 
+@@ -977,12 +978,12 @@ static int cudbg_read_fw_mem(struct cudbg_init *pdbg_init,
  				/* TX and RX Payload regions can't overlap */
  				goto skip_read;
  
@@ -64,8 +127,22 @@ index 2b5f339e..dccc7fa4 100644
  		if (rc) {
  			cudbg_err->sys_err = rc;
  			cudbg_put_buff(&temp_buff, dbg_buff);
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib_common.h b/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib_common.h
+index 0b6d2303..6977a882 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib_common.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib_common.h
+@@ -101,6 +101,9 @@ struct cudbg_flash_hdr {
+ int cudbg_get_buff(struct cudbg_init *pdbg_init,
+ 		   struct cudbg_buffer *pdbg_buff, u32 size,
+ 		   struct cudbg_buffer *pin_buff);
++int cudbg_get_buff_aligned(struct cudbg_init *pdbg_init,
++			   struct cudbg_buffer *pdbg_buff, u32 size,
++			   struct cudbg_buffer *pin_buff, u32 align);
+ void cudbg_get_compress_buff(struct cudbg_init *pdbg_init,
+ 			     struct cudbg_buffer *pdbg_buff,
+ 			     struct cudbg_buffer *pin_buff);
 diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
-index 3bc48adb..8fbb6c46 100644
+index 1f330ddc..a085d3e7 100644
 --- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
 +++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
 @@ -835,7 +835,9 @@ struct adapter {
@@ -153,7 +230,7 @@ index 83b09d38..6e436a6d 100644
  		t4_free_mem(data);
  		return ret;
 diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
-index 79623a10..6aa082ee 100644
+index 26ade500..cc81f7e4 100644
 --- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
 +++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
 @@ -2078,11 +2078,11 @@ static int read_eq_indices(struct adapter *adap, u16 qid, u16 *pidx, u16 *cidx)
@@ -226,7 +303,7 @@ index 79623a10..6aa082ee 100644
  			}
  		}
  
-@@ -4952,6 +4960,10 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+@@ -4960,6 +4968,10 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
  	spin_lock_init(&adapter->stats_lock);
  	spin_lock_init(&adapter->tid_release_lock);
  	spin_lock_init(&adapter->mbox_lock);
